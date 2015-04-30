@@ -9,7 +9,9 @@
 
 /**
  *
- *一阶进化版:使用线程池,避免每个连接过来都需要新建线程,该版本的线程池尚未实现线程池的监控,包括自动增加和减少线程,线程监控等
+ *二阶进化版:实现简单的http协议;
+ *gcc -g -L/usr/lib/x86_64-linux-gnu -pthread -o ./out/sock_3 sock_3.c 
+ *gdb ./out/sock_3 core
  */
 struct client_info {
 	int fp;
@@ -58,7 +60,20 @@ typedef struct {
 	struct client_info *c_info;	
 } request_t;
 
+typedef struct {
+	char *method;
+	char *uri;
+    char *version;	
+} request_line;
+typedef struct {
+	char *name;
+	char *value;
+} request_header;
 void *http_process(void* arg);
+int read_req_line_from_client(int fp, char *buf, int size, int *req_line_split_pos);
+int read_req_header_from_client(int fp, char* buf_process_begin, int received, int size_to_read, request_header **headers);
+int dbg_req_header_buf(request_header *headers, int header_num);
+
 
 //==================HTTP相关的声明END===============
 
@@ -330,9 +345,9 @@ void *http_process(void* arg) {
 	pthread_t thread = pthread_self();
 	request_t *request = (request_t *) arg;
 	printf("thread[%lu] is processing task with sock[%d]\n", thread, request->c_info->fp);
+/*
 	char echo[] = "hello,please input the command\n";
 	char buf[10];
-
 	do {
 		if (-1 == write(request->c_info->fp, echo, strlen(echo))) {
 			printf("thread[%lu] write error:%s\n", pthread_self(),strerror(errno));
@@ -349,6 +364,222 @@ void *http_process(void* arg) {
 
 	printf("task with sock[%d] is end\n", request->c_info->fp);
 	close(request->c_info->fp);
+*/
+	char buf[8 * 1024];
+
+	memset(buf, '\0', 8 * 1024);
+	int req_line_split_pos[8];//第7个元素存储request_line的最后一个字符的位置;第8个元素存储已经读取到缓存的最后一个字符的位置
+	int i = 0;
+	for (;i < 8; i++) {
+		req_line_split_pos[i] = 0;
+	}
+	int recv_count = read_req_line_from_client(request->c_info->fp, buf, 8 * 1024, req_line_split_pos);
+	//此处应该根据不同的返回状态返回不同的response
+	printf("the requset_line_process return :%d\n", recv_count);
+	
+	char *buf_process_header_begin = buf + req_line_split_pos[6] + 3;//跳过request_line最后的\r\n
+	int buf_header_received = req_line_split_pos[7] - req_line_split_pos[6] - 2;//同上
+	int size_to_read = 8 * 1024 - recv_count;	
+
+	//printf("After read the request line, tht pos is [%d, %d, %d]\n", recv_count, req_line_split_pos[6], req_line_split_pos[7]);	
+	request_header *headers = malloc(sizeof(request_header));
+	request_header **headers_ptr;
+	headers_ptr = &headers;
+	int header_num = read_req_header_from_client(request->c_info->fp, buf_process_header_begin, buf_header_received, size_to_read, headers_ptr);
+	free(headers);
+
+	printf("the header_process return :%d\n", header_num);
+	if (header_num > 0) {
+		dbg_req_header_buf(*headers_ptr, header_num);
+	}	
+	close(request->c_info->fp);
+}
+
+int dbg_req_header_buf(request_header *headers, int header_num) {
+	printf("begin print the header===================================\n");
+	int i;
+	for(i = 0; i < header_num; i++) {
+		printf("name:%s\n" , (headers + i)->name);
+		printf("value:%s\n" , (headers + i)->value);
+	}
+	printf("end print the header===================================\n");
+}
+
+int read_req_header_from_client(int fp, char* buf_process_begin, int received, int size_to_read, request_header **headers_ptr) {
+
+	printf("I'm in read_req_header_from_client , received is %d, size_to_read is %d", received, size_to_read);
+	char *origin_start_buf = buf_process_begin;
+	int req_header_split_pos[3 * 50];//这里限制最多有50个header
+	int req_header_split_index = 0;
+	char last_end_line = 1;
+
+	int header_item_begin = -1, header_item_end = -1, header_item_colon = -1;
+	int header_item_has_colon = 0;
+	size_to_read += received;
+
+	int last_success_process_count = 0;
+	int success_process_header = 0;
+
+	int received_count = received;
+	char *buf_read_begin = buf_process_begin + received_count;
+	do {
+		buf_process_begin = buf_process_begin + last_success_process_count;
+		printf("the process address is :%p\n", buf_process_begin);
+		int i = 0;
+		for(; i < received; i++) {
+			printf("I'm in for: %d\n", *(buf_process_begin + i));
+			if (*(buf_process_begin + i) == '\n') {
+				if (*(buf_process_begin + i -1) == '\r') {
+					last_end_line ++;
+				} else {
+					return -1;//请求错误,必须以\r\n结束一行,??是否忽略这个\n还有待思考,这里暂且认为其不合法
+				}
+				if (last_end_line == 2) {
+					success_process_header = 1;
+					break;//连续读到两个\r\n,表明header读取结束
+				}
+				//一个header结束
+				header_item_end = i - 2 + last_success_process_count;
+				if (header_item_begin >= 0  && header_item_colon > 0) {
+					int j = 0;
+					req_header_split_pos[req_header_split_index++] = header_item_begin;
+					req_header_split_pos[req_header_split_index++] = header_item_colon;
+					req_header_split_pos[req_header_split_index++] = header_item_end;
+					header_item_begin = -1;
+					header_item_end = -1;
+					header_item_colon = -1;
+				} else {
+					//printf("===the header_split_index is %d , and i is %d\n", req_header_split_index, i);
+					return -2;//请求错误, header格式不正确
+				}
+			} else if (*(buf_process_begin + i) == ':' && header_item_colon == -1) {
+				header_item_has_colon = 1;
+				header_item_colon = i + last_success_process_count;
+			} else if (last_end_line == 1 && *(buf_process_begin + i) != '\r'){
+				header_item_begin = i + last_success_process_count;		
+				last_end_line = 0;
+			}
+			printf("I'm in for End, last_end_line is %d\n", last_end_line);
+		}	
+		printf("I'm out of for, last_end_line is %d\n", last_end_line);
+		last_success_process_count = i ;
+		if (1 == success_process_header) {
+			break;
+		}
+		printf("the last_success_process_count is %d\n", last_success_process_count);
+		size_to_read -= received;
+		if (size_to_read <=0 ) {
+			return -3;//错误,header超过长度
+		}
+		received = recv(fp, buf_read_begin, size_to_read, 0);
+		if (received <= 0) {
+			printf("error receive again\n");
+			return -4;
+		}
+		printf("buf_read_begin is :%p\n", buf_read_begin);
+		buf_read_begin = buf_read_begin + received;
+	} while(1);
+
+	//printf("dbg: the req_header_split_index is [%d]\n", req_header_split_index);
+
+	if (req_header_split_index <= 0) {
+		return 0;
+	}
+	printf("dbg: the req_header_split_pos [%d,%d,%d,%d]", req_header_split_pos[0], req_header_split_pos[1], req_header_split_pos[2], req_header_split_pos[3]);
+
+	printf("dbg:the req_header_split_pos [");
+	int k = 0;
+	for (;k<10;k++) {
+		printf("%d,",req_header_split_pos[k]);
+	}
+	printf("]\n");
+
+	int j = 0;
+	for (;j<20;j++) {
+		printf("%d,", *(origin_start_buf+j));
+	}
+	printf("\n");
+	int i = 0;
+	int header_item_num = req_header_split_index / 3;
+	request_header *headers = (request_header *)malloc(sizeof(request_header) * header_item_num);
+	*headers_ptr = headers;
+	for (; i < header_item_num; i++) {
+		(headers + i)->name = origin_start_buf + req_header_split_pos[i * 3 + 0];
+		*(origin_start_buf + req_header_split_pos[i*3 + 1]) = '\0';
+		printf("GOTC:name is->%s\n", (headers + i)->name);
+		(headers + i)->value = origin_start_buf + req_header_split_pos[i*3 + 1] + 1;
+		*(origin_start_buf + req_header_split_pos[i*3 + 2] + 1) = '\0';
+	}
+
+	return header_item_num;
+}
+
+void dbg_req_line_buf(char *buf, int *line_pos, char *prefix) {
+	printf("%s,pos[", prefix);
+	int i = 0;
+	for (; i < 8; i++) {
+		printf("%d,", line_pos[i]);
+	}
+	printf("],%s\n", buf);
+}
+
+int read_req_line_from_client(int fp, char *buf, int size, int *req_line_split_pos) {
+	//int req_line_split_pos[6];
+	int req_line_split_index = 0;
+	int last_success_pos = 0;
+	int received = 0;
+	int recv_count = 0;
+	int ends_with_new_line = 0;
+	do {
+		received = recv(fp, buf + last_success_pos, size-last_success_pos, 0);
+		if (received <= 0) {
+			printf("error receive \n");
+			return -1;
+		}
+		recv_count += received;	
+
+		char *tmp = buf + last_success_pos;
+		int i = 0;
+		char pre_is_space = 1;
+		for (; i < received  && req_line_split_index < 6; i++) {
+			if (*(tmp+i) == 32 && 0 == pre_is_space) {
+				req_line_split_pos[req_line_split_index++] = i - 1 + last_success_pos;	
+				pre_is_space = 1;
+			} else if (*(tmp + i) == '\n') {
+				if (i < 1) {
+					break;
+				}
+				if (*(tmp + i - 1) == '\r' && i > 1) {
+					req_line_split_pos[req_line_split_index++] = i - 2 + last_success_pos;	
+				} else {
+					req_line_split_pos[req_line_split_index++] = i - 1 + last_success_pos;	
+				}
+				ends_with_new_line = 1;
+				break;
+			} else if (1 == pre_is_space) {
+				pre_is_space = 0;
+				req_line_split_pos[req_line_split_index++] = i + last_success_pos;	
+			} else {
+				pre_is_space = 0;
+			}
+		}
+		if (req_line_split_index > 0) {
+			last_success_pos = req_line_split_pos[req_line_split_index - 1];
+		}
+	} while(0);
+	
+	if (ends_with_new_line != 1) {
+		return -1;//\r\n的位置不对
+	} else {
+		req_line_split_pos[6] = last_success_pos;
+	}
+	req_line_split_pos[7] = recv_count - 1;
+	dbg_req_line_buf(buf, req_line_split_pos, "dbg the buf:");
+	return recv_count;
+}
+
+int request_error_process() {
+	return 0;	
 }
 
 //========================================HTTP相关实现END==========================
